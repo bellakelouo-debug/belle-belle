@@ -59,10 +59,16 @@ STAKED_C_PLUS = "0x753937137Eb92871A6F3517514d4f1Ee860e3FDF"
 # LayerZero OFT bridge destination
 BASE_SEPOLIA_EID = 40245
 
-# ─── Daily Task Requirements (min, max) ──────────────────────────────────────
-# Each task amount is randomized between min and max per account.
+# ─── Daily Task Requirements ──────────────────────────────────────────────────
+# Amounts are randomized between (min, max) per tx so every account differs.
 
-TASK_MINT_T_PLUS   = (10, 18)       # Mint T+
+# Mint T+ and C+: done 5-6 times each, 100-300 per tx
+# Total minted must cover stake + send (T+) and bridge + receive (C+)
+MINT_PER_TX        = (100, 300)     # Amount per individual mint tx
+MINT_T_COUNT       = (5, 6)         # How many T+ mint tx
+MINT_C_COUNT       = (5, 6)         # How many C+ mint tx
+
+# Other tasks: 1 tx each, slightly above minimum
 TASK_STAKE_T_PLUS  = (113, 125)     # Stake T+
 TASK_BRIDGE_C_PLUS = (80, 92)       # Bridge C+ via OFT
 TASK_SEND_T_PLUS   = (422, 440)     # Send T+
@@ -70,9 +76,9 @@ TASK_RECEIVE_C_PLUS = (409, 425)    # Receive C+
 TASK_TOTAL_TX      = 32             # Min total tx (mint, stake, or bridge)
 
 # Extra tx amounts for padding to 32 (randomized per tx)
-EXTRA_MINT_RANGE   = (1, 5)         # Small extra mints
-EXTRA_STAKE_RANGE  = (1, 5)         # Small extra stakes
-EXTRA_BRIDGE_RANGE = (1, 4)         # Small extra bridges
+EXTRA_MINT_RANGE   = (50, 150)      # Extra mints to pad tx count
+EXTRA_STAKE_RANGE  = (5, 20)        # Extra stakes to pad tx count
+EXTRA_BRIDGE_RANGE = (3, 10)        # Extra bridges to pad tx count
 
 # ─── Faucet Tokens ────────────────────────────────────────────────────────────
 
@@ -720,20 +726,27 @@ def run_daily_tasks(
             other_account = Account.from_key(all_keys[other_idx])
             other_address = other_account.address
 
-    # Randomize amounts for this account (slightly above minimum)
-    amt_mint_tp   = rand_amount(*TASK_MINT_T_PLUS)
+    # Randomize amounts for this account
     amt_stake_tp  = rand_amount(*TASK_STAKE_T_PLUS)
     amt_bridge_cp = rand_amount(*TASK_BRIDGE_C_PLUS)
     amt_send_tp   = rand_amount(*TASK_SEND_T_PLUS)
     amt_recv_cp   = rand_amount(*TASK_RECEIVE_C_PLUS)
 
-    # Total T+ needed: mint_task + stake + send
-    total_tp_needed = amt_mint_tp + amt_stake_tp + amt_send_tp + 50  # 50 buffer for extras
-    # Total C+ needed: bridge + receive
-    total_cp_needed = amt_bridge_cp + amt_recv_cp + 30  # 30 buffer for extras
+    # Randomize mint counts (5-6 each)
+    mint_tp_count = random.randint(*MINT_T_COUNT)
+    mint_cp_count = random.randint(*MINT_C_COUNT)
 
-    log.info(f"  {C.CYAN}Randomized amounts:{C.RESET} "
-             f"mint={amt_mint_tp} T+, stake={amt_stake_tp} T+, bridge={amt_bridge_cp} C+, "
+    # Generate per-tx mint amounts
+    mint_tp_amounts = [rand_amount(*MINT_PER_TX) for _ in range(mint_tp_count)]
+    mint_cp_amounts = [rand_amount(*MINT_PER_TX) for _ in range(mint_cp_count)]
+    total_tp_minted = sum(mint_tp_amounts)
+    total_cp_minted = sum(mint_cp_amounts)
+
+    log.info(f"  {C.CYAN}Plan:{C.RESET} "
+             f"mint T+ {mint_tp_count}x (total ~{total_tp_minted:.0f}), "
+             f"mint C+ {mint_cp_count}x (total ~{total_cp_minted:.0f})")
+    log.info(f"  {C.CYAN}Tasks:{C.RESET} "
+             f"stake={amt_stake_tp} T+, bridge={amt_bridge_cp} C+, "
              f"send={amt_send_tp} T+, receive={amt_recv_cp} C+")
 
     # ─── Phase 1: Faucet Claims (7 tx) ─────────────────────────────────
@@ -744,25 +757,27 @@ def run_daily_tasks(
 
     # ─── Phase 2: Approve collateral ────────────────────────────────────
     log.info(f"  {C.MAGENTA}▸ Phase 2: Approvals{C.RESET}")
-    approve_if_needed(w3, account, USDT_SEPOLIA, T_PLUS_CONTRACT, int(total_tp_needed * 10**6), nonce, debug, "USDT→T+")
+    approve_if_needed(w3, account, USDT_SEPOLIA, T_PLUS_CONTRACT, int(total_tp_minted * 10**6), nonce, debug, "USDT→T+")
     nonce = w3.eth.get_transaction_count(account.address)
-    approve_if_needed(w3, account, USDC_SEPOLIA, C_PLUS_CONTRACT, int(total_cp_needed * 10**6), nonce, debug, "USDC→C+")
+    approve_if_needed(w3, account, USDC_SEPOLIA, C_PLUS_CONTRACT, int(total_cp_minted * 10**6), nonce, debug, "USDC→C+")
     nonce = w3.eth.get_transaction_count(account.address)
     time.sleep(random.uniform(1, 2))
 
-    # ─── Phase 3: Mint T+ (1 big mint for all T+ needed) ───────────────
-    log.info(f"  {C.MAGENTA}▸ Phase 3: Mint T+ ({total_tp_needed:.2f}){C.RESET}")
-    ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", total_tp_needed, max_retries)
-    if ok:
-        msb_tx += 1
-    time.sleep(random.uniform(1, 2))
+    # ─── Phase 3: Mint T+ (5-6 tx) ─────────────────────────────────────
+    log.info(f"  {C.MAGENTA}▸ Phase 3: Mint T+ ({mint_tp_count}x){C.RESET}")
+    for i, amt in enumerate(mint_tp_amounts, 1):
+        ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", amt, max_retries)
+        if ok:
+            msb_tx += 1
+        time.sleep(random.uniform(1, 2.5))
 
-    # ─── Phase 4: Mint C+ (1 big mint for all C+ needed) ───────────────
-    log.info(f"  {C.MAGENTA}▸ Phase 4: Mint C+ ({total_cp_needed:.2f}){C.RESET}")
-    ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", total_cp_needed, max_retries)
-    if ok:
-        msb_tx += 1
-    time.sleep(random.uniform(1, 2))
+    # ─── Phase 4: Mint C+ (5-6 tx) ─────────────────────────────────────
+    log.info(f"  {C.MAGENTA}▸ Phase 4: Mint C+ ({mint_cp_count}x){C.RESET}")
+    for i, amt in enumerate(mint_cp_amounts, 1):
+        ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", amt, max_retries)
+        if ok:
+            msb_tx += 1
+        time.sleep(random.uniform(1, 2.5))
 
     # ─── Phase 5: Stake T+ (1 tx) ──────────────────────────────────────
     log.info(f"  {C.MAGENTA}▸ Phase 5: Stake T+ ({amt_stake_tp}){C.RESET}")
@@ -794,39 +809,33 @@ def run_daily_tasks(
     # ─── Phase 9: Extra mint/stake/bridge to reach 32 tx ───────────────
     remaining = TASK_TOTAL_TX - msb_tx
     if remaining > 0:
-        log.info(f"  {C.MAGENTA}▸ Phase 9: Extra mint/stake/bridge ({remaining} more needed){C.RESET}")
+        log.info(f"  {C.MAGENTA}▸ Phase 9: Extra tx ({remaining} more mint/stake/bridge needed){C.RESET}")
 
-        # Distribute remaining: ~40% extra mints T+, ~30% extra mints C+, ~20% extra stakes, ~10% extra bridges
-        extra_mint_tp  = int(remaining * 0.35)
-        extra_mint_cp  = int(remaining * 0.25)
-        extra_stake_tp = int(remaining * 0.20)
-        extra_bridge   = remaining - extra_mint_tp - extra_mint_cp - extra_stake_tp
+        # Distribute: ~50% extra mints, ~30% extra stakes, ~20% extra bridges
+        extra_mint  = max(1, int(remaining * 0.50))
+        extra_stake = max(1, int(remaining * 0.30))
+        extra_bridge = remaining - extra_mint - extra_stake
 
-        for i in range(extra_mint_tp):
+        # Extra mints (alternate T+ and C+)
+        for i in range(extra_mint):
+            token = "T+" if i % 2 == 0 else "C+"
             amt = rand_amount(*EXTRA_MINT_RANGE)
-            ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", amt, max_retries)
+            ok, nonce = do_overlayer_mint(w3, account, nonce, debug, token, amt, max_retries)
             if ok:
                 msb_tx += 1
             time.sleep(random.uniform(0.5, 1.5))
 
-        for i in range(extra_mint_cp):
-            amt = rand_amount(*EXTRA_MINT_RANGE)
-            ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", amt, max_retries)
-            if ok:
-                msb_tx += 1
-            time.sleep(random.uniform(0.5, 1.5))
-
-        # Approve T+ for extra stakes (might need additional allowance)
-        approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, 100 * 10**18, nonce, debug, "T+→sT+ extra")
+        # Extra stakes
+        approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, 500 * 10**18, nonce, debug, "T+→sT+ extra")
         nonce = w3.eth.get_transaction_count(account.address)
-
-        for i in range(extra_stake_tp):
+        for i in range(extra_stake):
             amt = rand_amount(*EXTRA_STAKE_RANGE)
             ok, nonce = do_stake(w3, account, nonce, debug, "T+", amt, max_retries)
             if ok:
                 msb_tx += 1
             time.sleep(random.uniform(0.5, 1.5))
 
+        # Extra bridges
         for i in range(extra_bridge):
             amt = rand_amount(*EXTRA_BRIDGE_RANGE)
             ok, nonce = do_bridge_oft(w3, account, nonce, debug, "C+", amt, max_retries)
@@ -838,8 +847,8 @@ def run_daily_tasks(
     print(f"{C.DIM}{'─' * 58}{C.RESET}")
     log.info(f"  {C.BOLD}Daily Summary:{C.RESET}")
     log.info(f"    Faucet:            {C.GREEN}{faucet_ok}/7{C.RESET}")
-    log.info(f"    Mint T+:           {C.GREEN}{total_tp_needed:.2f}{C.RESET} (min {TASK_MINT_T_PLUS[0]})")
-    log.info(f"    Mint C+:           {C.GREEN}{total_cp_needed:.2f}{C.RESET}")
+    log.info(f"    Mint T+:           {C.GREEN}{total_tp_minted:.0f}{C.RESET} T+ in {mint_tp_count} tx")
+    log.info(f"    Mint C+:           {C.GREEN}{total_cp_minted:.0f}{C.RESET} C+ in {mint_cp_count} tx")
     log.info(f"    Stake T+:          {C.GREEN}{amt_stake_tp}{C.RESET} (min {TASK_STAKE_T_PLUS[0]})")
     log.info(f"    Bridge C+ (OFT):   {C.GREEN}{amt_bridge_cp}{C.RESET} (min {TASK_BRIDGE_C_PLUS[0]})")
     log.info(f"    Send T+:           {C.GREEN}{amt_send_tp}{C.RESET} (min {TASK_SEND_T_PLUS[0]})")
@@ -931,7 +940,8 @@ def main():
              f"Retries: {C.YELLOW}{max_retries}{C.RESET}")
 
     log.info(f"{C.BOLD}Daily Task Targets (randomized per account):{C.RESET}")
-    log.info(f"  Mint T+:    {C.YELLOW}{TASK_MINT_T_PLUS[0]}-{TASK_MINT_T_PLUS[1]}{C.RESET}")
+    log.info(f"  Mint T+:    {C.YELLOW}{MINT_T_COUNT[0]}-{MINT_T_COUNT[1]}x ({MINT_PER_TX[0]}-{MINT_PER_TX[1]} each){C.RESET}")
+    log.info(f"  Mint C+:    {C.YELLOW}{MINT_C_COUNT[0]}-{MINT_C_COUNT[1]}x ({MINT_PER_TX[0]}-{MINT_PER_TX[1]} each){C.RESET}")
     log.info(f"  Stake T+:   {C.YELLOW}{TASK_STAKE_T_PLUS[0]}-{TASK_STAKE_T_PLUS[1]}{C.RESET}")
     log.info(f"  Bridge C+:  {C.YELLOW}{TASK_BRIDGE_C_PLUS[0]}-{TASK_BRIDGE_C_PLUS[1]}{C.RESET}")
     log.info(f"  Send T+:    {C.YELLOW}{TASK_SEND_T_PLUS[0]}-{TASK_SEND_T_PLUS[1]}{C.RESET}")
