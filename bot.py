@@ -858,41 +858,78 @@ def run_daily_tasks(
     if remaining > 0:
         log.info(f"  {C.MAGENTA}▸ Phase 9: Smart fill ({remaining} more mint/stake/bridge needed){C.RESET}")
 
-        # Build a smart task queue: mix of mint, stake, bridge
-        # Use amounts that are at or slightly above each task's minimum
-        task_queue = []
-        for _ in range(remaining):
-            roll = random.random()
-            if roll < 0.45:
-                # Extra mint (alternate T+/C+), amount near task minimums
-                token = random.choice(["T+", "C+"])
-                task_queue.append(("mint", token, rand_amount(10, 50)))
-            elif roll < 0.75:
-                # Extra stake, amount near minimum
-                task_queue.append(("stake", "T+", rand_amount(10, 30)))
-            else:
-                # Extra bridge, amount near minimum
-                task_queue.append(("bridge", "C+", rand_amount(5, 15)))
+        # Check remaining collateral to decide which mints are possible
+        usdt_token = w3.eth.contract(address=Web3.to_checksum_address(USDT_SEPOLIA), abi=ERC20_ABI)
+        usdc_token = w3.eth.contract(address=Web3.to_checksum_address(USDC_SEPOLIA), abi=ERC20_ABI)
+        usdt_bal = usdt_token.functions.balanceOf(account.address).call() / (10 ** 6)
+        usdc_bal = usdc_token.functions.balanceOf(account.address).call() / (10 ** 6)
+        log.info(f"    Remaining collateral: USDT={usdt_bal:.0f}, USDC={usdc_bal:.0f}")
 
-        random.shuffle(task_queue)
+        # Also check T+ balance for stakes
+        tp_token = w3.eth.contract(address=Web3.to_checksum_address(T_PLUS_CONTRACT), abi=ERC20_ABI)
+        tp_bal = tp_token.functions.balanceOf(account.address).call() / (10 ** 18)
 
         # Pre-approve for extra stakes
-        has_stakes = any(t[0] == "stake" for t in task_queue)
-        if has_stakes:
-            approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, 1000 * 10**18, nonce, debug, "T+→sT+ extra")
-            nonce = w3.eth.get_transaction_count(account.address)
+        approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, 5000 * 10**18, nonce, debug, "T+→sT+ extra")
+        nonce = w3.eth.get_transaction_count(account.address)
 
-        for task_type, token, amt in task_queue:
-            if task_type == "mint":
-                ok, nonce = do_overlayer_mint(w3, account, nonce, debug, token, amt, max_retries)
-            elif task_type == "stake":
-                ok, nonce = do_stake(w3, account, nonce, debug, token, amt, max_retries)
-            elif task_type == "bridge":
-                ok, nonce = do_bridge_oft(w3, account, nonce, debug, token, amt, max_retries)
+        max_attempts = remaining + 10  # allow some retries
+        attempts = 0
+        while msb_tx < TASK_TOTAL_TX and attempts < max_attempts:
+            attempts += 1
+            roll = random.random()
+
+            # Pick task based on what's still possible
+            if roll < 0.40 and usdt_bal >= 15:
+                # Mint T+ (uses USDT)
+                amt = rand_amount(10, min(50, usdt_bal))
+                ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", amt, max_retries)
+                if ok:
+                    msb_tx += 1
+                    usdt_bal -= amt
+                    tp_bal += amt
+            elif roll < 0.55 and usdc_bal >= 15:
+                # Mint C+ (uses USDC)
+                amt = rand_amount(10, min(50, usdc_bal))
+                ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", amt, max_retries)
+                if ok:
+                    msb_tx += 1
+                    usdc_bal -= amt
+            elif roll < 0.80 and tp_bal >= 10:
+                # Stake T+
+                amt = rand_amount(5, min(30, tp_bal))
+                ok, nonce = do_stake(w3, account, nonce, debug, "T+", amt, max_retries)
+                if ok:
+                    msb_tx += 1
+                    tp_bal -= amt
+            elif usdt_bal >= 15:
+                # Fallback: mint T+
+                amt = rand_amount(10, min(50, usdt_bal))
+                ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", amt, max_retries)
+                if ok:
+                    msb_tx += 1
+                    usdt_bal -= amt
+                    tp_bal += amt
+            elif tp_bal >= 5:
+                # Fallback: stake T+
+                amt = rand_amount(3, min(20, tp_bal))
+                ok, nonce = do_stake(w3, account, nonce, debug, "T+", amt, max_retries)
+                if ok:
+                    msb_tx += 1
+                    tp_bal -= amt
             else:
-                ok = False
-            if ok:
-                msb_tx += 1
+                # Last resort: bridge small C+
+                cp_token_c = w3.eth.contract(address=Web3.to_checksum_address(C_PLUS_CONTRACT), abi=ERC20_ABI)
+                cp_bal = cp_token_c.functions.balanceOf(account.address).call() / (10 ** 18)
+                if cp_bal >= 3:
+                    amt = rand_amount(2, min(10, cp_bal))
+                    ok, nonce = do_bridge_oft(w3, account, nonce, debug, "C+", amt, max_retries)
+                    if ok:
+                        msb_tx += 1
+                else:
+                    log.warning(f"    {C.YELLOW}Low balances, can't fill more tx{C.RESET}")
+                    break
+
             time.sleep(random.uniform(0.5, 2))
 
     # ─── Summary ────────────────────────────────────────────────────────
