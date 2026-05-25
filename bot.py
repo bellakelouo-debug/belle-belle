@@ -462,6 +462,44 @@ def approve_if_needed(w3, account, token_addr, spender_addr, amount, nonce, debu
     return False, nonce
 
 
+# ─── Explorer Helper ──────────────────────────────────────────────────────────
+
+def fetch_random_explorer_address(exclude_addrs=None):
+    """Fetch a random active T+ holder address from Blockscout explorer."""
+    if exclude_addrs is None:
+        exclude_addrs = set()
+    exclude_lower = {a.lower() for a in exclude_addrs}
+
+    # Known contract/special addresses to skip
+    skip_lower = {
+        STAKED_T_PLUS.lower(), STAKED_C_PLUS.lower(),
+        T_PLUS_CONTRACT.lower(), C_PLUS_CONTRACT.lower(),
+        FAUCET_CONTRACT.lower(),
+        "0x0000000000000000000000000000000000055555",
+        "0x1100000000000000000000000000000000000000",
+        "0x6666666666666666666666666666666666666666",
+    }
+
+    try:
+        url = f"https://eth-sepolia.blockscout.com/api/v2/tokens/{T_PLUS_CONTRACT}/holders"
+        resp = requests.get(url, timeout=10)
+        items = resp.json().get("items", [])
+        candidates = []
+        for item in items:
+            addr = item.get("address", {}).get("hash", "")
+            if not addr:
+                continue
+            if addr.lower() in exclude_lower or addr.lower() in skip_lower:
+                continue
+            candidates.append(addr)
+        if candidates:
+            return random.choice(candidates)
+    except Exception as e:
+        log.warning(f"  Failed to fetch explorer address: {str(e)[:80]}")
+
+    return None
+
+
 # ─── Task Functions ───────────────────────────────────────────────────────────
 
 def do_faucet_claims(w3, account, nonce, debug, max_retries=3):
@@ -712,13 +750,15 @@ def run_daily_tasks(
     nonce = w3.eth.get_transaction_count(account.address)
     msb_tx = 0  # mint/stake/bridge tx counter
 
-    # Determine other wallet for send/receive
-    other_address = None
-    if all_keys and len(all_keys) > 1:
-        other_idx = (account_index) % len(all_keys)
-        if all_keys[other_idx] != private_key:
-            other_account = Account.from_key(all_keys[other_idx])
-            other_address = other_account.address
+    # Collect all other wallet addresses from pk.txt (excluding self)
+    other_addresses = []
+    if all_keys:
+        for k in all_keys:
+            if k != private_key:
+                try:
+                    other_addresses.append(Account.from_key(k).address)
+                except Exception:
+                    pass
 
     # Randomize amounts for this account
     amt_stake_tp  = rand_amount(*TASK_STAKE_T_PLUS)
@@ -782,11 +822,26 @@ def run_daily_tasks(
         msb_tx += 1
     time.sleep(random.uniform(1, 2))
 
-    # ─── Phase 6: Send T+ (1 tx) ───────────────────────────────────────
-    log.info(f"  {C.MAGENTA}▸ Phase 6: Send T+ ({amt_send_tp}){C.RESET}")
-    send_to = other_address if other_address else account.address
-    ok, nonce = do_send(w3, account, nonce, debug, "T+", amt_send_tp, send_to, max_retries)
-    time.sleep(random.uniform(1, 2))
+    # ─── Phase 6: Send T+ (to each wallet in pk.txt + 1 random explorer) ──
+    send_targets = list(other_addresses)  # all other wallets
+    if not send_targets:
+        send_targets = [account.address]  # fallback: self-transfer
+
+    # Fetch 1 random address from explorer
+    all_own_addrs = {account.address} | set(other_addresses)
+    explorer_addr = fetch_random_explorer_address(exclude_addrs=all_own_addrs)
+    if explorer_addr:
+        send_targets.append(explorer_addr)
+        log.info(f"  {C.CYAN}Explorer wallet:{C.RESET} {explorer_addr[:6]}...{explorer_addr[-4:]}")
+
+    # Distribute send amount across targets
+    num_targets = len(send_targets)
+    per_target = round(amt_send_tp / num_targets, 2)
+    log.info(f"  {C.MAGENTA}▸ Phase 6: Send T+ ({amt_send_tp}) to {num_targets} wallets ({per_target} each){C.RESET}")
+
+    for target in send_targets:
+        ok, nonce = do_send(w3, account, nonce, debug, "T+", per_target, target, max_retries)
+        time.sleep(random.uniform(1, 2))
 
     # ─── Phase 7: Bridge C+ via OFT (1 tx) ─────────────────────────────
     log.info(f"  {C.MAGENTA}▸ Phase 7: Bridge C+ ({amt_bridge_cp}){C.RESET}")
