@@ -62,9 +62,8 @@ BASE_SEPOLIA_EID = 40245
 # ─── Daily Task Requirements ──────────────────────────────────────────────────
 # Amounts are randomized between (min, max) per tx so every account differs.
 
-# Mint T+ and C+: done 5-6 times each, 100-300 per tx
-# Total minted must cover stake + send (T+) and bridge + receive (C+)
-MINT_PER_TX        = (100, 300)     # Amount per individual mint tx
+# Mint T+ and C+: done 5-6 times each, 500-1000 per tx (faucet gives 10K USDT+USDC daily)
+MINT_PER_TX        = (500, 1000)    # Amount per individual mint tx
 MINT_T_COUNT       = (5, 6)         # How many T+ mint tx
 MINT_C_COUNT       = (5, 6)         # How many C+ mint tx
 
@@ -74,11 +73,6 @@ TASK_BRIDGE_C_PLUS = (80, 92)       # Bridge C+ via OFT
 TASK_SEND_T_PLUS   = (422, 440)     # Send T+
 TASK_RECEIVE_C_PLUS = (409, 425)    # Receive C+
 TASK_TOTAL_TX      = 32             # Min total tx (mint, stake, or bridge)
-
-# Extra tx amounts for padding to 32 (randomized per tx)
-EXTRA_MINT_RANGE   = (50, 150)      # Extra mints to pad tx count
-EXTRA_STAKE_RANGE  = (5, 20)        # Extra stakes to pad tx count
-EXTRA_BRIDGE_RANGE = (3, 10)        # Extra bridges to pad tx count
 
 # ─── Faucet Tokens ────────────────────────────────────────────────────────────
 
@@ -806,42 +800,47 @@ def run_daily_tasks(
     ok, nonce = do_send(w3, account, nonce, debug, "C+", amt_recv_cp, account.address, max_retries)
     time.sleep(random.uniform(1, 2))
 
-    # ─── Phase 9: Extra mint/stake/bridge to reach 32 tx ───────────────
+    # ─── Phase 9: Smart extra tx to reach 32 ───────────────────────────
     remaining = TASK_TOTAL_TX - msb_tx
     if remaining > 0:
-        log.info(f"  {C.MAGENTA}▸ Phase 9: Extra tx ({remaining} more mint/stake/bridge needed){C.RESET}")
+        log.info(f"  {C.MAGENTA}▸ Phase 9: Smart fill ({remaining} more mint/stake/bridge needed){C.RESET}")
 
-        # Distribute: ~50% extra mints, ~30% extra stakes, ~20% extra bridges
-        extra_mint  = max(1, int(remaining * 0.50))
-        extra_stake = max(1, int(remaining * 0.30))
-        extra_bridge = remaining - extra_mint - extra_stake
+        # Build a smart task queue: mix of mint, stake, bridge
+        # Use amounts that are at or slightly above each task's minimum
+        task_queue = []
+        for _ in range(remaining):
+            roll = random.random()
+            if roll < 0.45:
+                # Extra mint (alternate T+/C+), amount near task minimums
+                token = random.choice(["T+", "C+"])
+                task_queue.append(("mint", token, rand_amount(10, 50)))
+            elif roll < 0.75:
+                # Extra stake, amount near minimum
+                task_queue.append(("stake", "T+", rand_amount(10, 30)))
+            else:
+                # Extra bridge, amount near minimum
+                task_queue.append(("bridge", "C+", rand_amount(5, 15)))
 
-        # Extra mints (alternate T+ and C+)
-        for i in range(extra_mint):
-            token = "T+" if i % 2 == 0 else "C+"
-            amt = rand_amount(*EXTRA_MINT_RANGE)
-            ok, nonce = do_overlayer_mint(w3, account, nonce, debug, token, amt, max_retries)
+        random.shuffle(task_queue)
+
+        # Pre-approve for extra stakes
+        has_stakes = any(t[0] == "stake" for t in task_queue)
+        if has_stakes:
+            approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, 1000 * 10**18, nonce, debug, "T+→sT+ extra")
+            nonce = w3.eth.get_transaction_count(account.address)
+
+        for task_type, token, amt in task_queue:
+            if task_type == "mint":
+                ok, nonce = do_overlayer_mint(w3, account, nonce, debug, token, amt, max_retries)
+            elif task_type == "stake":
+                ok, nonce = do_stake(w3, account, nonce, debug, token, amt, max_retries)
+            elif task_type == "bridge":
+                ok, nonce = do_bridge_oft(w3, account, nonce, debug, token, amt, max_retries)
+            else:
+                ok = False
             if ok:
                 msb_tx += 1
-            time.sleep(random.uniform(0.5, 1.5))
-
-        # Extra stakes
-        approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, 500 * 10**18, nonce, debug, "T+→sT+ extra")
-        nonce = w3.eth.get_transaction_count(account.address)
-        for i in range(extra_stake):
-            amt = rand_amount(*EXTRA_STAKE_RANGE)
-            ok, nonce = do_stake(w3, account, nonce, debug, "T+", amt, max_retries)
-            if ok:
-                msb_tx += 1
-            time.sleep(random.uniform(0.5, 1.5))
-
-        # Extra bridges
-        for i in range(extra_bridge):
-            amt = rand_amount(*EXTRA_BRIDGE_RANGE)
-            ok, nonce = do_bridge_oft(w3, account, nonce, debug, "C+", amt, max_retries)
-            if ok:
-                msb_tx += 1
-            time.sleep(random.uniform(1, 3))
+            time.sleep(random.uniform(0.5, 2))
 
     # ─── Summary ────────────────────────────────────────────────────────
     print(f"{C.DIM}{'─' * 58}{C.RESET}")
