@@ -462,44 +462,6 @@ def approve_if_needed(w3, account, token_addr, spender_addr, amount, nonce, debu
     return False, nonce
 
 
-# ─── Explorer Helper ──────────────────────────────────────────────────────────
-
-def fetch_random_explorer_address(exclude_addrs=None):
-    """Fetch a random active T+ holder address from Blockscout explorer."""
-    if exclude_addrs is None:
-        exclude_addrs = set()
-    exclude_lower = {a.lower() for a in exclude_addrs}
-
-    # Known contract/special addresses to skip
-    skip_lower = {
-        STAKED_T_PLUS.lower(), STAKED_C_PLUS.lower(),
-        T_PLUS_CONTRACT.lower(), C_PLUS_CONTRACT.lower(),
-        FAUCET_CONTRACT.lower(),
-        "0x0000000000000000000000000000000000055555",
-        "0x1100000000000000000000000000000000000000",
-        "0x6666666666666666666666666666666666666666",
-    }
-
-    try:
-        url = f"https://eth-sepolia.blockscout.com/api/v2/tokens/{T_PLUS_CONTRACT}/holders"
-        resp = requests.get(url, timeout=10)
-        items = resp.json().get("items", [])
-        candidates = []
-        for item in items:
-            addr = item.get("address", {}).get("hash", "")
-            if not addr:
-                continue
-            if addr.lower() in exclude_lower or addr.lower() in skip_lower:
-                continue
-            candidates.append(addr)
-        if candidates:
-            return random.choice(candidates)
-    except Exception as e:
-        log.warning(f"  Failed to fetch explorer address: {str(e)[:80]}")
-
-    return None
-
-
 # ─── Task Functions ───────────────────────────────────────────────────────────
 
 def do_faucet_claims(w3, account, nonce, debug, max_retries=3):
@@ -750,13 +712,13 @@ def run_daily_tasks(
     nonce = w3.eth.get_transaction_count(account.address)
     msb_tx = 0  # mint/stake/bridge tx counter
 
-    # Collect all other wallet addresses from pk.txt (excluding self)
-    other_addresses = []
+    # Collect all other wallets from pk.txt (excluding self) — key + address pairs
+    other_wallets = []
     if all_keys:
         for k in all_keys:
             if k != private_key:
                 try:
-                    other_addresses.append(Account.from_key(k).address)
+                    other_wallets.append((k, Account.from_key(k).address))
                 except Exception:
                     pass
 
@@ -822,26 +784,14 @@ def run_daily_tasks(
         msb_tx += 1
     time.sleep(random.uniform(1, 2))
 
-    # ─── Phase 6: Send T+ (to each wallet in pk.txt + 1 random explorer) ──
-    send_targets = list(other_addresses)  # all other wallets
-    if not send_targets:
-        send_targets = [account.address]  # fallback: self-transfer
-
-    # Fetch 1 random address from explorer
-    all_own_addrs = {account.address} | set(other_addresses)
-    explorer_addr = fetch_random_explorer_address(exclude_addrs=all_own_addrs)
-    if explorer_addr:
-        send_targets.append(explorer_addr)
-        log.info(f"  {C.CYAN}Explorer wallet:{C.RESET} {explorer_addr[:6]}...{explorer_addr[-4:]}")
-
-    # Distribute send amount across targets
-    num_targets = len(send_targets)
-    per_target = round(amt_send_tp / num_targets, 2)
-    log.info(f"  {C.MAGENTA}▸ Phase 6: Send T+ ({amt_send_tp}) to {num_targets} wallets ({per_target} each){C.RESET}")
-
-    for target in send_targets:
-        ok, nonce = do_send(w3, account, nonce, debug, "T+", per_target, target, max_retries)
-        time.sleep(random.uniform(1, 2))
+    # ─── Phase 6: Send T+ (1 tx to another wallet in pk.txt) ───────────
+    if other_wallets:
+        send_target = random.choice(other_wallets)[1]  # pick random other wallet
+        log.info(f"  {C.MAGENTA}▸ Phase 6: Send {amt_send_tp} T+ → {send_target[:6]}...{send_target[-4:]}{C.RESET}")
+        ok, nonce = do_send(w3, account, nonce, debug, "T+", amt_send_tp, send_target, max_retries)
+    else:
+        log.warning(f"  {C.YELLOW}▸ Phase 6: SKIP Send — need 2+ wallets in pk.txt{C.RESET}")
+    time.sleep(random.uniform(1, 2))
 
     # ─── Phase 7: Bridge C+ via OFT (1 tx) ─────────────────────────────
     log.info(f"  {C.MAGENTA}▸ Phase 7: Bridge C+ ({amt_bridge_cp}){C.RESET}")
@@ -850,9 +800,57 @@ def run_daily_tasks(
         msb_tx += 1
     time.sleep(random.uniform(1, 2))
 
-    # ─── Phase 8: Receive C+ (1 tx, self-transfer or cross-wallet) ─────
-    log.info(f"  {C.MAGENTA}▸ Phase 8: Receive C+ ({amt_recv_cp}){C.RESET}")
-    ok, nonce = do_send(w3, account, nonce, debug, "C+", amt_recv_cp, account.address, max_retries)
+    # ─── Phase 8: Receive C+ (another wallet sends C+ to this wallet) ───
+    if other_wallets:
+        # Pick a sender wallet and have it send C+ to this account
+        sender_key, sender_addr = random.choice(other_wallets)
+        sender_account = Account.from_key(sender_key)
+        log.info(f"  {C.MAGENTA}▸ Phase 8: Receive {amt_recv_cp} C+ ← {sender_addr[:6]}...{sender_addr[-4:]}{C.RESET}")
+
+        # Check sender's C+ balance first
+        cp_token = w3.eth.contract(address=Web3.to_checksum_address(C_PLUS_CONTRACT), abi=ERC20_ABI)
+        sender_cp_balance = cp_token.functions.balanceOf(sender_addr).call()
+        sender_cp_human = sender_cp_balance / (10 ** 18)
+        log.info(f"    Sender C+ balance: {sender_cp_human:.2f}")
+
+        if sender_cp_human >= amt_recv_cp:
+            # Sender has enough, send directly
+            sender_nonce = w3.eth.get_transaction_count(sender_addr)
+            ok, sender_nonce = do_send(w3, sender_account, sender_nonce, debug, "C+", amt_recv_cp, account.address, max_retries)
+            if ok:
+                log.info(f"    {C.GREEN}[OK]{C.RESET} Received {amt_recv_cp} C+")
+            else:
+                log.warning(f"    {C.YELLOW}Receive failed, trying other wallets...{C.RESET}")
+                # Try other wallets
+                for other_key, other_addr in other_wallets:
+                    if other_addr == sender_addr:
+                        continue
+                    bal = cp_token.functions.balanceOf(other_addr).call() / (10 ** 18)
+                    if bal >= amt_recv_cp:
+                        other_acc = Account.from_key(other_key)
+                        other_nonce = w3.eth.get_transaction_count(other_addr)
+                        ok, _ = do_send(w3, other_acc, other_nonce, debug, "C+", amt_recv_cp, account.address, max_retries)
+                        if ok:
+                            log.info(f"    {C.GREEN}[OK]{C.RESET} Received {amt_recv_cp} C+ from {other_addr[:6]}...{other_addr[-4:]}")
+                            break
+        else:
+            # Sender doesn't have enough, try other wallets
+            log.warning(f"    {C.YELLOW}Sender has only {sender_cp_human:.2f} C+, checking others...{C.RESET}")
+            received = False
+            for other_key, other_addr in other_wallets:
+                bal = cp_token.functions.balanceOf(other_addr).call() / (10 ** 18)
+                if bal >= amt_recv_cp:
+                    other_acc = Account.from_key(other_key)
+                    other_nonce = w3.eth.get_transaction_count(other_addr)
+                    ok, _ = do_send(w3, other_acc, other_nonce, debug, "C+", amt_recv_cp, account.address, max_retries)
+                    if ok:
+                        log.info(f"    {C.GREEN}[OK]{C.RESET} Received {amt_recv_cp} C+ from {other_addr[:6]}...{other_addr[-4:]}")
+                        received = True
+                        break
+            if not received:
+                log.warning(f"    {C.YELLOW}No wallet has enough C+ to send. Receive task incomplete.{C.RESET}")
+    else:
+        log.warning(f"  {C.YELLOW}▸ Phase 8: SKIP Receive — need 2+ wallets in pk.txt{C.RESET}")
     time.sleep(random.uniform(1, 2))
 
     # ─── Phase 9: Smart extra tx to reach 32 ───────────────────────────
