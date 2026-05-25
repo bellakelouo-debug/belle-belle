@@ -1,0 +1,4 @@
+# Private keys - one per line
+# Lines starting with # are ignored
+# Example:
+# 65c6fd87f6286083a0a055c13361103b49950bec14011b12591ea35687a97ae1

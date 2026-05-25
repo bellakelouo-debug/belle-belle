@@ -1,0 +1,8 @@
+# Proxy list - one per line
+# Supported formats:
+#   ip:port                        (default HTTP)
+#   http://ip:port
+#   https://ip:port
+#   socks5://ip:port
+#   http://user:pass@ip:port
+#   socks5://user:pass@ip:port
