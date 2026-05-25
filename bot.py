@@ -8,8 +8,8 @@ Automates all daily transactions on Ethereum Sepolia for the Overlayer testnet:
   - Bridge C+ via LayerZero OFT to Base Sepolia
   - Send T+ (ERC-20 transfer)
   - Receive C+ (ERC-20 transfer)
-  - Ensures at least 32 total transactions per cycle
-Supports multiple accounts, proxy rotation, retry logic, and 24-hour loop.
+  - Ensures at least 32 total transactions per cycle (mint, stake, or bridge)
+Each task uses randomized amounts (slightly above minimum) so every account differs.
 """
 
 import os
@@ -59,14 +59,20 @@ STAKED_C_PLUS = "0x753937137Eb92871A6F3517514d4f1Ee860e3FDF"
 # LayerZero OFT bridge destination
 BASE_SEPOLIA_EID = 40245
 
-# ─── Daily Task Minimums ──────────────────────────────────────────────────────
+# ─── Daily Task Requirements (min, max) ──────────────────────────────────────
+# Each task amount is randomized between min and max per account.
 
-MIN_MINT_T_PLUS = 10        # Mint at least 10 T+
-MIN_STAKE_T_PLUS = 113      # Stake at least 113 T+
-MIN_BRIDGE_C_PLUS = 80      # Bridge at least 80 C+ via OFT
-MIN_SEND_T_PLUS = 422       # Send at least 422 T+
-MIN_RECEIVE_C_PLUS = 409    # Receive at least 409 C+
-MIN_TOTAL_TX = 32           # At least 32 total transactions
+TASK_MINT_T_PLUS   = (10, 18)       # Mint T+
+TASK_STAKE_T_PLUS  = (113, 125)     # Stake T+
+TASK_BRIDGE_C_PLUS = (80, 92)       # Bridge C+ via OFT
+TASK_SEND_T_PLUS   = (422, 440)     # Send T+
+TASK_RECEIVE_C_PLUS = (409, 425)    # Receive C+
+TASK_TOTAL_TX      = 32             # Min total tx (mint, stake, or bridge)
+
+# Extra tx amounts for padding to 32 (randomized per tx)
+EXTRA_MINT_RANGE   = (1, 5)         # Small extra mints
+EXTRA_STAKE_RANGE  = (1, 5)         # Small extra stakes
+EXTRA_BRIDGE_RANGE = (1, 4)         # Small extra bridges
 
 # ─── Faucet Tokens ────────────────────────────────────────────────────────────
 
@@ -82,7 +88,7 @@ FAUCET_TOKENS = [
 
 # ─── ABIs ─────────────────────────────────────────────────────────────────────
 
-FAUCET_ABI = json.loads(json.dumps([
+FAUCET_ABI = [
     {
         "inputs": [
             {"name": "token", "type": "address"},
@@ -94,9 +100,9 @@ FAUCET_ABI = json.loads(json.dumps([
         "stateMutability": "nonpayable",
         "type": "function",
     }
-]))
+]
 
-ERC20_ABI = json.loads(json.dumps([
+ERC20_ABI = [
     {
         "inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}],
         "name": "approve",
@@ -125,9 +131,9 @@ ERC20_ABI = json.loads(json.dumps([
         "stateMutability": "view",
         "type": "function",
     },
-]))
+]
 
-OVERLAYER_WRAP_ABI = json.loads(json.dumps([
+OVERLAYER_WRAP_ABI = [
     {
         "inputs": [
             {
@@ -147,9 +153,9 @@ OVERLAYER_WRAP_ABI = json.loads(json.dumps([
         "stateMutability": "nonpayable",
         "type": "function",
     },
-]))
+]
 
-STAKED_OVERLAYER_ABI = json.loads(json.dumps([
+STAKED_OVERLAYER_ABI = [
     {
         "inputs": [
             {"name": "assets_", "type": "uint256"},
@@ -160,9 +166,9 @@ STAKED_OVERLAYER_ABI = json.loads(json.dumps([
         "stateMutability": "nonpayable",
         "type": "function",
     },
-]))
+]
 
-OFT_SEND_ABI = json.loads(json.dumps([
+OFT_SEND_ABI = [
     {
         "inputs": [
             {
@@ -245,7 +251,7 @@ OFT_SEND_ABI = json.loads(json.dumps([
         "stateMutability": "view",
         "type": "function",
     },
-]))
+]
 
 # ─── RPC Endpoints ────────────────────────────────────────────────────────────
 
@@ -260,7 +266,12 @@ RPC_ENDPOINTS = [
 LOOP_INTERVAL = 24 * 60 * 60  # 24 hours
 
 
-# ─── Color Codes ──────────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def rand_amount(min_val, max_val):
+    """Random float between min and max, rounded to 2 decimals."""
+    return round(random.uniform(min_val, max_val), 2)
+
 
 class C:
     RESET  = "\033[0m"
@@ -432,17 +443,17 @@ def send_tx(w3, account, tx, nonce, debug=False, label="TX"):
 
 
 def approve_if_needed(w3, account, token_addr, spender_addr, amount, nonce, debug=False, label="Approve"):
-    """Approve spender if current allowance is insufficient."""
+    """Approve spender if current allowance is insufficient. Returns (tx_sent, new_nonce)."""
     token = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI)
     current = token.functions.allowance(account.address, Web3.to_checksum_address(spender_addr)).call()
     if current >= amount:
-        log.debug(f"  [{label}] Already approved ({current} >= {amount})")
-        return True, nonce
+        log.debug(f"  [{label}] Already approved")
+        return False, nonce
 
     log.info(f"  {C.BLUE}[APPROVE]{C.RESET} {label}")
     tx = token.functions.approve(
         Web3.to_checksum_address(spender_addr),
-        2**256 - 1  # max approval
+        2**256 - 1
     ).build_transaction({"from": account.address, "value": 0})
     receipt, nonce = send_tx(w3, account, tx, nonce, debug, label)
     if receipt:
@@ -489,11 +500,7 @@ def do_faucet_claims(w3, account, nonce, debug, max_retries=3):
 
 
 def do_overlayer_mint(w3, account, nonce, debug, token_type="T+", amount_human=100, max_retries=2):
-    """
-    Mint T+ or C+ via OverlayerWrap.
-    token_type: 'T+' or 'C+'
-    amount_human: amount in human-readable units (e.g., 100 = 100 T+)
-    """
+    """Mint T+ or C+ via OverlayerWrap. Single transaction."""
     if token_type == "T+":
         wrap_addr = Web3.to_checksum_address(T_PLUS_CONTRACT)
         collateral_addr = Web3.to_checksum_address(USDT_SEPOLIA)
@@ -508,11 +515,11 @@ def do_overlayer_mint(w3, account, nonce, debug, token_type="T+", amount_human=1
     wrap_amount = int(amount_human * (10 ** 18))
 
     order = (
-        account.address,     # benefactor
-        account.address,     # beneficiary
-        collateral_addr,     # collateral
-        collateral_amount,   # collateralAmount
-        wrap_amount,         # overlayerWrapAmount
+        account.address,
+        account.address,
+        collateral_addr,
+        collateral_amount,
+        wrap_amount,
     )
 
     for attempt in range(1, max_retries + 1):
@@ -523,7 +530,7 @@ def do_overlayer_mint(w3, account, nonce, debug, token_type="T+", amount_human=1
             })
             receipt, nonce = send_tx(w3, account, tx, nonce, debug, f"Mint-{token_type}")
             if receipt:
-                log.info(f"  {C.GREEN}[OK]{C.RESET} Mint {token_type.ljust(5)} | {amount_human} {token_type} | Gas: {receipt.gasUsed}")
+                log.info(f"  {C.GREEN}[OK]{C.RESET} Mint {token_type.ljust(3)} | {amount_human} {token_type} | Gas: {receipt.gasUsed}")
                 return True, nonce
             else:
                 if attempt < max_retries:
@@ -537,12 +544,10 @@ def do_overlayer_mint(w3, account, nonce, debug, token_type="T+", amount_human=1
 
 
 def do_stake(w3, account, nonce, debug, token_type="T+", amount_human=40, max_retries=2):
-    """Stake T+ or C+ into StakedOverlayerWrap."""
+    """Stake T+ or C+ into StakedOverlayerWrap. Single transaction."""
     if token_type == "T+":
-        wrap_addr = Web3.to_checksum_address(T_PLUS_CONTRACT)
         staked_addr = Web3.to_checksum_address(STAKED_T_PLUS)
     else:
-        wrap_addr = Web3.to_checksum_address(C_PLUS_CONTRACT)
         staked_addr = Web3.to_checksum_address(STAKED_C_PLUS)
 
     staked_contract = w3.eth.contract(address=staked_addr, abi=STAKED_OVERLAYER_ABI)
@@ -555,7 +560,7 @@ def do_stake(w3, account, nonce, debug, token_type="T+", amount_human=40, max_re
             ).build_transaction({"from": account.address, "value": 0})
             receipt, nonce = send_tx(w3, account, tx, nonce, debug, f"Stake-{token_type}")
             if receipt:
-                log.info(f"  {C.GREEN}[OK]{C.RESET} Stake {token_type.ljust(5)} | {amount_human} {token_type} | Gas: {receipt.gasUsed}")
+                log.info(f"  {C.GREEN}[OK]{C.RESET} Stake {token_type.ljust(3)} | {amount_human} {token_type} | Gas: {receipt.gasUsed}")
                 return True, nonce
             else:
                 if attempt < max_retries:
@@ -569,14 +574,14 @@ def do_stake(w3, account, nonce, debug, token_type="T+", amount_human=40, max_re
 
 
 def do_send(w3, account, nonce, debug, token_type="T+", amount_human=150, to_address=None, max_retries=2):
-    """Send T+ or C+ via ERC-20 transfer."""
+    """Send T+ or C+ via ERC-20 transfer. Single transaction."""
     if token_type == "T+":
         token_addr = Web3.to_checksum_address(T_PLUS_CONTRACT)
     else:
         token_addr = Web3.to_checksum_address(C_PLUS_CONTRACT)
 
     if to_address is None:
-        to_address = account.address  # self-transfer
+        to_address = account.address
 
     token = w3.eth.contract(address=token_addr, abi=ERC20_ABI)
     amount_wei = int(amount_human * (10 ** 18))
@@ -589,7 +594,7 @@ def do_send(w3, account, nonce, debug, token_type="T+", amount_human=150, to_add
             receipt, nonce = send_tx(w3, account, tx, nonce, debug, f"Send-{token_type}")
             if receipt:
                 short_to = f"{to_address[:6]}...{to_address[-4:]}"
-                log.info(f"  {C.GREEN}[OK]{C.RESET} Send {token_type.ljust(5)} | {amount_human} {token_type} → {short_to} | Gas: {receipt.gasUsed}")
+                log.info(f"  {C.GREEN}[OK]{C.RESET} Send {token_type.ljust(3)} | {amount_human} {token_type} → {short_to} | Gas: {receipt.gasUsed}")
                 return True, nonce
             else:
                 if attempt < max_retries:
@@ -603,7 +608,7 @@ def do_send(w3, account, nonce, debug, token_type="T+", amount_human=150, to_add
 
 
 def do_bridge_oft(w3, account, nonce, debug, token_type="C+", amount_human=28, max_retries=2):
-    """Bridge C+ or T+ via LayerZero OFT to Base Sepolia."""
+    """Bridge C+ or T+ via LayerZero OFT to Base Sepolia. Single transaction."""
     if token_type == "C+":
         token_addr = Web3.to_checksum_address(C_PLUS_CONTRACT)
     else:
@@ -615,7 +620,6 @@ def do_bridge_oft(w3, account, nonce, debug, token_type="C+", amount_human=28, m
 
     to_bytes32 = b'\x00' * 12 + bytes.fromhex(account.address[2:])
 
-    # Build LZ executor options (gas for destination execution)
     exec_gas = 200000
     extra_options = (
         b'\x00\x03'
@@ -638,9 +642,8 @@ def do_bridge_oft(w3, account, nonce, debug, token_type="C+", amount_human=28, m
 
     for attempt in range(1, max_retries + 1):
         try:
-            # Get quote for messaging fee
             quote = oft_contract.functions.quoteSend(send_param, False).call()
-            native_fee = int(quote[0] * 1.1)  # 10% buffer
+            native_fee = int(quote[0] * 1.1)
             fee_param = (native_fee, 0)
 
             tx = oft_contract.functions.send(
@@ -653,7 +656,7 @@ def do_bridge_oft(w3, account, nonce, debug, token_type="C+", amount_human=28, m
             if receipt:
                 fee_eth = Web3.from_wei(native_fee, 'ether')
                 log.info(
-                    f"  {C.GREEN}[OK]{C.RESET} Bridge {token_type.ljust(5)} "
+                    f"  {C.GREEN}[OK]{C.RESET} Bridge {token_type.ljust(3)} "
                     f"| {amount_human} {token_type} → Base Sepolia "
                     f"| Fee: {fee_eth:.6f} ETH | Gas: {receipt.gasUsed}"
                 )
@@ -698,7 +701,6 @@ def run_daily_tasks(
         log.error("  Failed to connect to any RPC endpoint")
         return False
 
-    # Check ETH balance
     eth_balance = w3.eth.get_balance(account.address)
     eth_amount = Web3.from_wei(eth_balance, "ether")
     log.info(f"  ETH Balance: {C.YELLOW}{eth_amount:.6f}{C.RESET} ETH")
@@ -708,164 +710,141 @@ def run_daily_tasks(
         return False
 
     nonce = w3.eth.get_transaction_count(account.address)
-    tx_count = 0
+    msb_tx = 0  # mint/stake/bridge tx counter
 
-    # Determine the other wallet address for send/receive (if multiple keys)
+    # Determine other wallet for send/receive
     other_address = None
     if all_keys and len(all_keys) > 1:
-        other_idx = (account_index) % len(all_keys)  # next wallet
+        other_idx = (account_index) % len(all_keys)
         if all_keys[other_idx] != private_key:
             other_account = Account.from_key(all_keys[other_idx])
             other_address = other_account.address
 
+    # Randomize amounts for this account (slightly above minimum)
+    amt_mint_tp   = rand_amount(*TASK_MINT_T_PLUS)
+    amt_stake_tp  = rand_amount(*TASK_STAKE_T_PLUS)
+    amt_bridge_cp = rand_amount(*TASK_BRIDGE_C_PLUS)
+    amt_send_tp   = rand_amount(*TASK_SEND_T_PLUS)
+    amt_recv_cp   = rand_amount(*TASK_RECEIVE_C_PLUS)
+
+    # Total T+ needed: mint_task + stake + send
+    total_tp_needed = amt_mint_tp + amt_stake_tp + amt_send_tp + 50  # 50 buffer for extras
+    # Total C+ needed: bridge + receive
+    total_cp_needed = amt_bridge_cp + amt_recv_cp + 30  # 30 buffer for extras
+
+    log.info(f"  {C.CYAN}Randomized amounts:{C.RESET} "
+             f"mint={amt_mint_tp} T+, stake={amt_stake_tp} T+, bridge={amt_bridge_cp} C+, "
+             f"send={amt_send_tp} T+, receive={amt_recv_cp} C+")
+
     # ─── Phase 1: Faucet Claims (7 tx) ─────────────────────────────────
     log.info(f"  {C.MAGENTA}▸ Phase 1: Faucet Claims{C.RESET}")
     faucet_ok, nonce = do_faucet_claims(w3, account, nonce, debug, max_retries)
-    tx_count += faucet_ok
     log.info(f"  Faucet: {C.GREEN}{faucet_ok}/7{C.RESET} claimed")
     time.sleep(random.uniform(1, 3))
 
     # ─── Phase 2: Approve collateral ────────────────────────────────────
     log.info(f"  {C.MAGENTA}▸ Phase 2: Approvals{C.RESET}")
-
-    # Approve USDT → T+ contract
-    ok, nonce = approve_if_needed(
-        w3, account, USDT_SEPOLIA, T_PLUS_CONTRACT,
-        10000 * 10**6, nonce, debug, "USDT→T+"
-    )
-    if ok and nonce > w3.eth.get_transaction_count(account.address) - 1:
-        # Only count if a new tx was sent
-        pass  # approval might not need a new tx
-
-    # Approve USDC → C+ contract
-    ok, nonce = approve_if_needed(
-        w3, account, USDC_SEPOLIA, C_PLUS_CONTRACT,
-        10000 * 10**6, nonce, debug, "USDC→C+"
-    )
-
+    approve_if_needed(w3, account, USDT_SEPOLIA, T_PLUS_CONTRACT, int(total_tp_needed * 10**6), nonce, debug, "USDT→T+")
+    nonce = w3.eth.get_transaction_count(account.address)
+    approve_if_needed(w3, account, USDC_SEPOLIA, C_PLUS_CONTRACT, int(total_cp_needed * 10**6), nonce, debug, "USDC→C+")
+    nonce = w3.eth.get_transaction_count(account.address)
     time.sleep(random.uniform(1, 2))
 
-    # ─── Phase 3: Mint T+ (multiple small mints) ───────────────────────
-    log.info(f"  {C.MAGENTA}▸ Phase 3: Mint T+{C.RESET}")
-    total_t_plus_needed = MIN_SEND_T_PLUS + MIN_STAKE_T_PLUS + MIN_MINT_T_PLUS + 50  # buffer
-    mint_t_per_tx = total_t_plus_needed // 5 + 1
-    t_plus_minted = 0
+    # ─── Phase 3: Mint T+ (1 big mint for all T+ needed) ───────────────
+    log.info(f"  {C.MAGENTA}▸ Phase 3: Mint T+ ({total_tp_needed:.2f}){C.RESET}")
+    ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", total_tp_needed, max_retries)
+    if ok:
+        msb_tx += 1
+    time.sleep(random.uniform(1, 2))
 
-    for i in range(5):
-        ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", mint_t_per_tx, max_retries)
-        if ok:
-            t_plus_minted += mint_t_per_tx
-            tx_count += 1
-        time.sleep(random.uniform(0.5, 1.5))
+    # ─── Phase 4: Mint C+ (1 big mint for all C+ needed) ───────────────
+    log.info(f"  {C.MAGENTA}▸ Phase 4: Mint C+ ({total_cp_needed:.2f}){C.RESET}")
+    ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", total_cp_needed, max_retries)
+    if ok:
+        msb_tx += 1
+    time.sleep(random.uniform(1, 2))
 
-    log.info(f"  T+ minted: {C.GREEN}{t_plus_minted}{C.RESET}")
+    # ─── Phase 5: Stake T+ (1 tx) ──────────────────────────────────────
+    log.info(f"  {C.MAGENTA}▸ Phase 5: Stake T+ ({amt_stake_tp}){C.RESET}")
+    approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, int(amt_stake_tp * 10**18), nonce, debug, "T+→sT+")
+    nonce = w3.eth.get_transaction_count(account.address)
+    ok, nonce = do_stake(w3, account, nonce, debug, "T+", amt_stake_tp, max_retries)
+    if ok:
+        msb_tx += 1
+    time.sleep(random.uniform(1, 2))
 
-    # ─── Phase 4: Mint C+ (multiple small mints) ───────────────────────
-    log.info(f"  {C.MAGENTA}▸ Phase 4: Mint C+{C.RESET}")
-    total_c_plus_needed = MIN_BRIDGE_C_PLUS + MIN_RECEIVE_C_PLUS + 50  # buffer
-    mint_c_per_tx = total_c_plus_needed // 4 + 1
-    c_plus_minted = 0
-
-    for i in range(4):
-        ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", mint_c_per_tx, max_retries)
-        if ok:
-            c_plus_minted += mint_c_per_tx
-            tx_count += 1
-        time.sleep(random.uniform(0.5, 1.5))
-
-    log.info(f"  C+ minted: {C.GREEN}{c_plus_minted}{C.RESET}")
-
-    # ─── Phase 5: Approve T+ → StakedOverlayerWrap ─────────────────────
-    log.info(f"  {C.MAGENTA}▸ Phase 5: Stake T+{C.RESET}")
-    ok, nonce = approve_if_needed(
-        w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS,
-        MIN_STAKE_T_PLUS * 10**18, nonce, debug, "T+→sT+"
-    )
-
-    # Stake T+ (multiple small stakes)
-    stake_per_tx = MIN_STAKE_T_PLUS // 3 + 1
-    t_plus_staked = 0
-    for i in range(3):
-        ok, nonce = do_stake(w3, account, nonce, debug, "T+", stake_per_tx, max_retries)
-        if ok:
-            t_plus_staked += stake_per_tx
-            tx_count += 1
-        time.sleep(random.uniform(0.5, 1.5))
-
-    log.info(f"  T+ staked: {C.GREEN}{t_plus_staked}{C.RESET}")
-
-    # ─── Phase 6: Send T+ ──────────────────────────────────────────────
-    log.info(f"  {C.MAGENTA}▸ Phase 6: Send T+{C.RESET}")
-    send_per_tx = MIN_SEND_T_PLUS // 3 + 1
-    t_plus_sent = 0
+    # ─── Phase 6: Send T+ (1 tx) ───────────────────────────────────────
+    log.info(f"  {C.MAGENTA}▸ Phase 6: Send T+ ({amt_send_tp}){C.RESET}")
     send_to = other_address if other_address else account.address
+    ok, nonce = do_send(w3, account, nonce, debug, "T+", amt_send_tp, send_to, max_retries)
+    time.sleep(random.uniform(1, 2))
 
-    for i in range(3):
-        ok, nonce = do_send(w3, account, nonce, debug, "T+", send_per_tx, send_to, max_retries)
-        if ok:
-            t_plus_sent += send_per_tx
-            tx_count += 1
-        time.sleep(random.uniform(0.5, 1.5))
+    # ─── Phase 7: Bridge C+ via OFT (1 tx) ─────────────────────────────
+    log.info(f"  {C.MAGENTA}▸ Phase 7: Bridge C+ ({amt_bridge_cp}){C.RESET}")
+    ok, nonce = do_bridge_oft(w3, account, nonce, debug, "C+", amt_bridge_cp, max_retries)
+    if ok:
+        msb_tx += 1
+    time.sleep(random.uniform(1, 2))
 
-    log.info(f"  T+ sent: {C.GREEN}{t_plus_sent}{C.RESET}")
+    # ─── Phase 8: Receive C+ (1 tx, self-transfer or cross-wallet) ─────
+    log.info(f"  {C.MAGENTA}▸ Phase 8: Receive C+ ({amt_recv_cp}){C.RESET}")
+    ok, nonce = do_send(w3, account, nonce, debug, "C+", amt_recv_cp, account.address, max_retries)
+    time.sleep(random.uniform(1, 2))
 
-    # ─── Phase 7: Bridge C+ via OFT ────────────────────────────────────
-    log.info(f"  {C.MAGENTA}▸ Phase 7: Bridge C+ (OFT → Base Sepolia){C.RESET}")
-    bridge_per_tx = MIN_BRIDGE_C_PLUS // 3 + 1
-    c_plus_bridged = 0
+    # ─── Phase 9: Extra mint/stake/bridge to reach 32 tx ───────────────
+    remaining = TASK_TOTAL_TX - msb_tx
+    if remaining > 0:
+        log.info(f"  {C.MAGENTA}▸ Phase 9: Extra mint/stake/bridge ({remaining} more needed){C.RESET}")
 
-    for i in range(3):
-        ok, nonce = do_bridge_oft(w3, account, nonce, debug, "C+", bridge_per_tx, max_retries)
-        if ok:
-            c_plus_bridged += bridge_per_tx
-            tx_count += 1
-        time.sleep(random.uniform(1, 3))
+        # Distribute remaining: ~40% extra mints T+, ~30% extra mints C+, ~20% extra stakes, ~10% extra bridges
+        extra_mint_tp  = int(remaining * 0.35)
+        extra_mint_cp  = int(remaining * 0.25)
+        extra_stake_tp = int(remaining * 0.20)
+        extra_bridge   = remaining - extra_mint_tp - extra_mint_cp - extra_stake_tp
 
-    log.info(f"  C+ bridged: {C.GREEN}{c_plus_bridged}{C.RESET}")
-
-    # ─── Phase 8: Receive C+ (self-transfer or cross-wallet) ───────────
-    log.info(f"  {C.MAGENTA}▸ Phase 8: Receive C+{C.RESET}")
-    receive_per_tx = MIN_RECEIVE_C_PLUS // 5 + 1
-    c_plus_received = 0
-
-    for i in range(5):
-        ok, nonce = do_send(w3, account, nonce, debug, "C+", receive_per_tx, account.address, max_retries)
-        if ok:
-            c_plus_received += receive_per_tx
-            tx_count += 1
-        time.sleep(random.uniform(0.5, 1.5))
-
-    log.info(f"  C+ received (self-transfer): {C.GREEN}{c_plus_received}{C.RESET}")
-
-    # ─── Phase 9: Extra transactions if needed to reach 32 ─────────────
-    actual_nonce = w3.eth.get_transaction_count(account.address)
-    actual_tx_count = actual_nonce - (actual_nonce - tx_count)  # approximate
-
-    if tx_count < MIN_TOTAL_TX:
-        remaining = MIN_TOTAL_TX - tx_count
-        log.info(f"  {C.MAGENTA}▸ Phase 9: Extra TX ({remaining} more needed){C.RESET}")
-
-        # Do extra small mints or transfers to reach 32
-        for i in range(remaining):
-            # Alternate between small T+ mints and C+ mints
-            if i % 2 == 0:
-                ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", 1, max_retries)
-            else:
-                ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", 1, max_retries)
+        for i in range(extra_mint_tp):
+            amt = rand_amount(*EXTRA_MINT_RANGE)
+            ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", amt, max_retries)
             if ok:
-                tx_count += 1
-            time.sleep(random.uniform(0.5, 1.0))
+                msb_tx += 1
+            time.sleep(random.uniform(0.5, 1.5))
+
+        for i in range(extra_mint_cp):
+            amt = rand_amount(*EXTRA_MINT_RANGE)
+            ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", amt, max_retries)
+            if ok:
+                msb_tx += 1
+            time.sleep(random.uniform(0.5, 1.5))
+
+        # Approve T+ for extra stakes (might need additional allowance)
+        approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, 100 * 10**18, nonce, debug, "T+→sT+ extra")
+        nonce = w3.eth.get_transaction_count(account.address)
+
+        for i in range(extra_stake_tp):
+            amt = rand_amount(*EXTRA_STAKE_RANGE)
+            ok, nonce = do_stake(w3, account, nonce, debug, "T+", amt, max_retries)
+            if ok:
+                msb_tx += 1
+            time.sleep(random.uniform(0.5, 1.5))
+
+        for i in range(extra_bridge):
+            amt = rand_amount(*EXTRA_BRIDGE_RANGE)
+            ok, nonce = do_bridge_oft(w3, account, nonce, debug, "C+", amt, max_retries)
+            if ok:
+                msb_tx += 1
+            time.sleep(random.uniform(1, 3))
 
     # ─── Summary ────────────────────────────────────────────────────────
     print(f"{C.DIM}{'─' * 58}{C.RESET}")
     log.info(f"  {C.BOLD}Daily Summary:{C.RESET}")
-    log.info(f"    Faucet claims:    {C.GREEN}{faucet_ok}/7{C.RESET}")
-    log.info(f"    T+ minted:        {C.GREEN}{t_plus_minted}{C.RESET} (min {MIN_MINT_T_PLUS})")
-    log.info(f"    T+ staked:        {C.GREEN}{t_plus_staked}{C.RESET} (min {MIN_STAKE_T_PLUS})")
-    log.info(f"    C+ bridged (OFT): {C.GREEN}{c_plus_bridged}{C.RESET} (min {MIN_BRIDGE_C_PLUS})")
-    log.info(f"    T+ sent:          {C.GREEN}{t_plus_sent}{C.RESET} (min {MIN_SEND_T_PLUS})")
-    log.info(f"    C+ received:      {C.GREEN}{c_plus_received}{C.RESET} (min {MIN_RECEIVE_C_PLUS})")
-    log.info(f"    Total TX:         {C.GREEN}{tx_count}{C.RESET} (min {MIN_TOTAL_TX})")
+    log.info(f"    Faucet:            {C.GREEN}{faucet_ok}/7{C.RESET}")
+    log.info(f"    Mint T+:           {C.GREEN}{total_tp_needed:.2f}{C.RESET} (min {TASK_MINT_T_PLUS[0]})")
+    log.info(f"    Mint C+:           {C.GREEN}{total_cp_needed:.2f}{C.RESET}")
+    log.info(f"    Stake T+:          {C.GREEN}{amt_stake_tp}{C.RESET} (min {TASK_STAKE_T_PLUS[0]})")
+    log.info(f"    Bridge C+ (OFT):   {C.GREEN}{amt_bridge_cp}{C.RESET} (min {TASK_BRIDGE_C_PLUS[0]})")
+    log.info(f"    Send T+:           {C.GREEN}{amt_send_tp}{C.RESET} (min {TASK_SEND_T_PLUS[0]})")
+    log.info(f"    Receive C+:        {C.GREEN}{amt_recv_cp}{C.RESET} (min {TASK_RECEIVE_C_PLUS[0]})")
+    log.info(f"    Mint/Stake/Bridge: {C.GREEN}{msb_tx}{C.RESET} tx (min {TASK_TOTAL_TX})")
 
     return True
 
@@ -908,14 +887,12 @@ def show_banner():
 def main():
     show_banner()
 
-    # ── Configuration ──
     pk_file = os.getenv("PK_FILE", "pk.txt")
     proxy_file = os.getenv("PROXY_FILE", "proxy.txt")
     debug = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
     max_retries = int(os.getenv("MAX_RETRIES", "3"))
     use_proxy = os.getenv("USE_PROXY", "").lower() in ("true", "1", "yes")
 
-    # Interactive setup (only if not running in non-interactive mode)
     if sys.stdin.isatty() and not os.getenv("NON_INTERACTIVE"):
         debug_input = input(f"{C.CYAN}[?]{C.RESET} Enable debug mode? (y/n, default: n): ").strip().lower()
         if debug_input in ("y", "yes", "true", "1"):
@@ -929,14 +906,12 @@ def main():
     global log
     log = setup_logger(debug)
 
-    # Load private keys
     private_keys = load_private_keys(pk_file)
     if not private_keys:
         log.error("No valid private keys found in pk.txt")
         sys.exit(1)
     log.info(f"Loaded {C.GREEN}{len(private_keys)}{C.RESET} account(s)")
 
-    # Load proxies
     rotator = ProxyRotator([])
     if use_proxy:
         proxies = load_proxies(proxy_file)
@@ -946,27 +921,24 @@ def main():
         else:
             log.warning(f"No proxies found in {proxy_file}, running without proxy")
 
-    # Fake User-Agent
     try:
         ua_gen = UserAgent()
     except Exception:
         ua_gen = None
         log.warning("fake-useragent failed to initialize, using default UA")
 
-    log.info(f"Debug mode: {C.YELLOW}{'ON' if debug else 'OFF'}{C.RESET}")
-    log.info(f"Max retries: {C.YELLOW}{max_retries}{C.RESET}")
+    log.info(f"Debug: {C.YELLOW}{'ON' if debug else 'OFF'}{C.RESET} | "
+             f"Retries: {C.YELLOW}{max_retries}{C.RESET}")
 
-    # Show daily task targets
-    log.info(f"{C.BOLD}Daily Task Targets:{C.RESET}")
-    log.info(f"  Mint T+:    {C.YELLOW}{MIN_MINT_T_PLUS}{C.RESET}")
-    log.info(f"  Stake T+:   {C.YELLOW}{MIN_STAKE_T_PLUS}{C.RESET}")
-    log.info(f"  Bridge C+:  {C.YELLOW}{MIN_BRIDGE_C_PLUS}{C.RESET}")
-    log.info(f"  Send T+:    {C.YELLOW}{MIN_SEND_T_PLUS}{C.RESET}")
-    log.info(f"  Receive C+: {C.YELLOW}{MIN_RECEIVE_C_PLUS}{C.RESET}")
-    log.info(f"  Total TX:   {C.YELLOW}{MIN_TOTAL_TX}{C.RESET}")
+    log.info(f"{C.BOLD}Daily Task Targets (randomized per account):{C.RESET}")
+    log.info(f"  Mint T+:    {C.YELLOW}{TASK_MINT_T_PLUS[0]}-{TASK_MINT_T_PLUS[1]}{C.RESET}")
+    log.info(f"  Stake T+:   {C.YELLOW}{TASK_STAKE_T_PLUS[0]}-{TASK_STAKE_T_PLUS[1]}{C.RESET}")
+    log.info(f"  Bridge C+:  {C.YELLOW}{TASK_BRIDGE_C_PLUS[0]}-{TASK_BRIDGE_C_PLUS[1]}{C.RESET}")
+    log.info(f"  Send T+:    {C.YELLOW}{TASK_SEND_T_PLUS[0]}-{TASK_SEND_T_PLUS[1]}{C.RESET}")
+    log.info(f"  Receive C+: {C.YELLOW}{TASK_RECEIVE_C_PLUS[0]}-{TASK_RECEIVE_C_PLUS[1]}{C.RESET}")
+    log.info(f"  Total TX:   {C.YELLOW}{TASK_TOTAL_TX}{C.RESET} (mint/stake/bridge)")
     print(f"{C.DIM}{'─' * 58}{C.RESET}")
 
-    # ── Graceful shutdown ──
     running = True
 
     def signal_handler(sig, frame):
@@ -978,7 +950,6 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # ── Main loop ──
     cycle = 0
     while running:
         cycle += 1
