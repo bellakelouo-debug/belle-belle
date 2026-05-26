@@ -442,24 +442,55 @@ def send_tx(w3, account, tx, nonce, debug=False, label="TX"):
         return None, nonce + 1
 
 
+MAX_UINT256 = 2**256 - 1
+APPROVAL_THRESHOLD = 2**128  # re-approve when allowance drops below this
+
+
 def approve_if_needed(w3, account, token_addr, spender_addr, amount, nonce, debug=False, label="Approve"):
     """Approve spender if current allowance is insufficient. Returns (tx_sent, new_nonce)."""
     token = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI)
     current = token.functions.allowance(account.address, Web3.to_checksum_address(spender_addr)).call()
-    if current >= amount:
-        log.debug(f"  [{label}] Already approved")
+    if current >= max(amount, APPROVAL_THRESHOLD):
+        log.debug(f"  [{label}] Already approved ({current})")
         return False, nonce
 
     log.info(f"  {C.BLUE}[APPROVE]{C.RESET} {label}")
     tx = token.functions.approve(
         Web3.to_checksum_address(spender_addr),
-        2**256 - 1
+        MAX_UINT256
     ).build_transaction({"from": account.address, "value": 0})
     receipt, nonce = send_tx(w3, account, tx, nonce, debug, label)
     if receipt:
         log.info(f"  {C.GREEN}[OK]{C.RESET} {label} | Gas: {receipt.gasUsed}")
         return True, nonce
     return False, nonce
+
+
+def force_approve(w3, account, token_addr, spender_addr, nonce, debug=False, label="Force-Approve"):
+    """Always send an approve for max uint256 regardless of current allowance."""
+    token = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI)
+    log.info(f"  {C.BLUE}[APPROVE]{C.RESET} {label}")
+    tx = token.functions.approve(
+        Web3.to_checksum_address(spender_addr),
+        MAX_UINT256
+    ).build_transaction({"from": account.address, "value": 0})
+    receipt, nonce = send_tx(w3, account, tx, nonce, debug, label)
+    if receipt:
+        log.info(f"  {C.GREEN}[OK]{C.RESET} {label} | Gas: {receipt.gasUsed}")
+        return True, nonce
+    return False, nonce
+
+
+def check_balance(w3, token_addr, owner_addr, decimals=18):
+    """Check ERC20 balance. Returns human-readable amount."""
+    token = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI)
+    return token.functions.balanceOf(Web3.to_checksum_address(owner_addr)).call() / (10 ** decimals)
+
+
+def check_allowance(w3, token_addr, owner_addr, spender_addr):
+    """Check ERC20 allowance (raw wei)."""
+    token = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI)
+    return token.functions.allowance(Web3.to_checksum_address(owner_addr), Web3.to_checksum_address(spender_addr)).call()
 
 
 # ─── Task Functions ───────────────────────────────────────────────────────────
@@ -500,24 +531,37 @@ def do_faucet_claims(w3, account, nonce, debug, max_retries=3):
 
 
 def do_overlayer_mint(w3, account, nonce, debug, token_type="T+", amount_human=100, max_retries=2):
-    """Mint T+ or C+ via OverlayerWrap. Single transaction."""
+    """Mint T+ or C+ via OverlayerWrap. Pre-checks balance and allowance."""
     if token_type == "T+":
         wrap_addr = Web3.to_checksum_address(T_PLUS_CONTRACT)
-        collateral_addr = Web3.to_checksum_address(USDT_SEPOLIA)
+        collateral_addr = USDT_SEPOLIA
         collateral_decimals = 6
     else:
         wrap_addr = Web3.to_checksum_address(C_PLUS_CONTRACT)
-        collateral_addr = Web3.to_checksum_address(USDC_SEPOLIA)
+        collateral_addr = USDC_SEPOLIA
         collateral_decimals = 6
 
-    wrap_contract = w3.eth.contract(address=wrap_addr, abi=OVERLAYER_WRAP_ABI)
+    # Pre-check: collateral balance
+    col_bal = check_balance(w3, collateral_addr, account.address, collateral_decimals)
+    if col_bal < amount_human:
+        log.warning(f"  [Mint-{token_type}] Skip — collateral balance {col_bal:.1f} < {amount_human}")
+        return False, nonce
+
+    # Pre-check: allowance — re-approve if insufficient
     collateral_amount = int(amount_human * (10 ** collateral_decimals))
+    raw_allowance = check_allowance(w3, collateral_addr, account.address, wrap_addr)
+    if raw_allowance < collateral_amount:
+        log.info(f"  [Mint-{token_type}] Allowance low ({raw_allowance}), re-approving...")
+        _, nonce = force_approve(w3, account, collateral_addr, wrap_addr, nonce, debug, f"Re-approve {token_type}")
+        nonce = w3.eth.get_transaction_count(account.address)
+
+    wrap_contract = w3.eth.contract(address=wrap_addr, abi=OVERLAYER_WRAP_ABI)
     wrap_amount = int(amount_human * (10 ** 18))
 
     order = (
         account.address,
         account.address,
-        collateral_addr,
+        Web3.to_checksum_address(collateral_addr),
         collateral_amount,
         wrap_amount,
     )
@@ -536,7 +580,19 @@ def do_overlayer_mint(w3, account, nonce, debug, token_type="T+", amount_human=1
                 if attempt < max_retries:
                     time.sleep(3)
         except Exception as e:
-            log.error(f"  [Mint-{token_type}] Error (attempt {attempt}/{max_retries}): {str(e)[:120]}")
+            err_str = str(e)
+            # Allowance error — re-approve and retry
+            if "exceeds allowance" in err_str and attempt == 1:
+                log.warning(f"  [Mint-{token_type}] Allowance error, re-approving...")
+                _, nonce = force_approve(w3, account, collateral_addr, wrap_addr, nonce, debug, f"Re-approve {token_type}")
+                nonce = w3.eth.get_transaction_count(account.address)
+                time.sleep(2)
+                continue
+            # Collateral depleted (custom error 0x16400bf7)
+            if "0x16400bf7" in err_str:
+                log.warning(f"  [Mint-{token_type}] Collateral depleted, skipping")
+                return False, nonce
+            log.error(f"  [Mint-{token_type}] Error (attempt {attempt}/{max_retries}): {err_str[:120]}")
             if attempt < max_retries:
                 time.sleep(3 * attempt)
 
@@ -544,14 +600,29 @@ def do_overlayer_mint(w3, account, nonce, debug, token_type="T+", amount_human=1
 
 
 def do_stake(w3, account, nonce, debug, token_type="T+", amount_human=40, max_retries=2):
-    """Stake T+ or C+ into StakedOverlayerWrap. Single transaction."""
+    """Stake T+ or C+ into StakedOverlayerWrap. Pre-checks balance and allowance."""
     if token_type == "T+":
+        token_addr = T_PLUS_CONTRACT
         staked_addr = Web3.to_checksum_address(STAKED_T_PLUS)
     else:
+        token_addr = C_PLUS_CONTRACT
         staked_addr = Web3.to_checksum_address(STAKED_C_PLUS)
 
-    staked_contract = w3.eth.contract(address=staked_addr, abi=STAKED_OVERLAYER_ABI)
+    # Pre-check: token balance
+    tok_bal = check_balance(w3, token_addr, account.address, 18)
+    if tok_bal < amount_human:
+        log.warning(f"  [Stake-{token_type}] Skip — balance {tok_bal:.1f} < {amount_human}")
+        return False, nonce
+
+    # Pre-check: allowance
     amount_wei = int(amount_human * (10 ** 18))
+    raw_allowance = check_allowance(w3, token_addr, account.address, staked_addr)
+    if raw_allowance < amount_wei:
+        log.info(f"  [Stake-{token_type}] Allowance low, re-approving...")
+        _, nonce = force_approve(w3, account, token_addr, staked_addr, nonce, debug, f"Re-approve stake {token_type}")
+        nonce = w3.eth.get_transaction_count(account.address)
+
+    staked_contract = w3.eth.contract(address=staked_addr, abi=STAKED_OVERLAYER_ABI)
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -566,7 +637,14 @@ def do_stake(w3, account, nonce, debug, token_type="T+", amount_human=40, max_re
                 if attempt < max_retries:
                     time.sleep(3)
         except Exception as e:
-            log.error(f"  [Stake-{token_type}] Error (attempt {attempt}/{max_retries}): {str(e)[:120]}")
+            err_str = str(e)
+            if "exceeds allowance" in err_str and attempt == 1:
+                log.warning(f"  [Stake-{token_type}] Allowance error, re-approving...")
+                _, nonce = force_approve(w3, account, token_addr, staked_addr, nonce, debug, f"Re-approve stake {token_type}")
+                nonce = w3.eth.get_transaction_count(account.address)
+                time.sleep(2)
+                continue
+            log.error(f"  [Stake-{token_type}] Error (attempt {attempt}/{max_retries}): {err_str[:120]}")
             if attempt < max_retries:
                 time.sleep(3 * attempt)
 
@@ -751,11 +829,19 @@ def run_daily_tasks(
     log.info(f"  Faucet: {C.GREEN}{faucet_ok}/7{C.RESET} claimed")
     time.sleep(random.uniform(1, 3))
 
-    # ─── Phase 2: Approve collateral ────────────────────────────────────
+    # ─── Phase 2: Approve collateral (max uint256 for all pairs) ───────
     log.info(f"  {C.MAGENTA}▸ Phase 2: Approvals{C.RESET}")
-    approve_if_needed(w3, account, USDT_SEPOLIA, T_PLUS_CONTRACT, int(total_tp_minted * 10**6), nonce, debug, "USDT→T+")
+    # Approve USDT → T+ (for minting T+)
+    approve_if_needed(w3, account, USDT_SEPOLIA, T_PLUS_CONTRACT, APPROVAL_THRESHOLD, nonce, debug, "USDT→T+")
     nonce = w3.eth.get_transaction_count(account.address)
-    approve_if_needed(w3, account, USDC_SEPOLIA, C_PLUS_CONTRACT, int(total_cp_minted * 10**6), nonce, debug, "USDC→C+")
+    # Approve USDC → C+ (for minting C+)
+    approve_if_needed(w3, account, USDC_SEPOLIA, C_PLUS_CONTRACT, APPROVAL_THRESHOLD, nonce, debug, "USDC→C+")
+    nonce = w3.eth.get_transaction_count(account.address)
+    # Approve T+ → sT+ (for staking T+)
+    approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, APPROVAL_THRESHOLD, nonce, debug, "T+→sT+")
+    nonce = w3.eth.get_transaction_count(account.address)
+    # Approve C+ → sC+ (for staking C+)
+    approve_if_needed(w3, account, C_PLUS_CONTRACT, STAKED_C_PLUS, APPROVAL_THRESHOLD, nonce, debug, "C+→sC+")
     nonce = w3.eth.get_transaction_count(account.address)
     time.sleep(random.uniform(1, 2))
 
@@ -765,6 +851,11 @@ def run_daily_tasks(
         ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", amt, max_retries)
         if ok:
             msb_tx += 1
+        else:
+            usdt_left = check_balance(w3, USDT_SEPOLIA, account.address, 6)
+            if usdt_left < 100:
+                log.warning(f"    {C.YELLOW}USDT low ({usdt_left:.0f}), stopping T+ mints{C.RESET}")
+                break
         time.sleep(random.uniform(1, 2.5))
 
     # ─── Phase 4: Mint C+ (5-6 tx) ─────────────────────────────────────
@@ -773,12 +864,15 @@ def run_daily_tasks(
         ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", amt, max_retries)
         if ok:
             msb_tx += 1
+        else:
+            usdc_left = check_balance(w3, USDC_SEPOLIA, account.address, 6)
+            if usdc_left < 100:
+                log.warning(f"    {C.YELLOW}USDC low ({usdc_left:.0f}), stopping C+ mints{C.RESET}")
+                break
         time.sleep(random.uniform(1, 2.5))
 
     # ─── Phase 5: Stake T+ (1 tx) ──────────────────────────────────────
     log.info(f"  {C.MAGENTA}▸ Phase 5: Stake T+ ({amt_stake_tp}){C.RESET}")
-    approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, int(amt_stake_tp * 10**18), nonce, debug, "T+→sT+")
-    nonce = w3.eth.get_transaction_count(account.address)
     ok, nonce = do_stake(w3, account, nonce, debug, "T+", amt_stake_tp, max_retries)
     if ok:
         msb_tx += 1
@@ -858,30 +952,30 @@ def run_daily_tasks(
     if remaining > 0:
         log.info(f"  {C.MAGENTA}▸ Phase 9: Smart fill ({remaining} more mint/stake/bridge needed){C.RESET}")
 
-        # Check remaining collateral to decide which mints are possible
-        usdt_token = w3.eth.contract(address=Web3.to_checksum_address(USDT_SEPOLIA), abi=ERC20_ABI)
-        usdc_token = w3.eth.contract(address=Web3.to_checksum_address(USDC_SEPOLIA), abi=ERC20_ABI)
-        usdt_bal = usdt_token.functions.balanceOf(account.address).call() / (10 ** 6)
-        usdc_bal = usdc_token.functions.balanceOf(account.address).call() / (10 ** 6)
-        log.info(f"    Remaining collateral: USDT={usdt_bal:.0f}, USDC={usdc_bal:.0f}")
+        # Query all balances
+        usdt_bal = check_balance(w3, USDT_SEPOLIA, account.address, 6)
+        usdc_bal = check_balance(w3, USDC_SEPOLIA, account.address, 6)
+        tp_bal = check_balance(w3, T_PLUS_CONTRACT, account.address, 18)
+        cp_bal = check_balance(w3, C_PLUS_CONTRACT, account.address, 18)
+        log.info(f"    Balances: USDT={usdt_bal:.0f}, USDC={usdc_bal:.0f}, T+={tp_bal:.0f}, C+={cp_bal:.0f}")
 
-        # Also check T+ balance for stakes
-        tp_token = w3.eth.contract(address=Web3.to_checksum_address(T_PLUS_CONTRACT), abi=ERC20_ABI)
-        tp_bal = tp_token.functions.balanceOf(account.address).call() / (10 ** 18)
-
-        # Pre-approve for extra stakes
-        approve_if_needed(w3, account, T_PLUS_CONTRACT, STAKED_T_PLUS, 5000 * 10**18, nonce, debug, "T+→sT+ extra")
-        nonce = w3.eth.get_transaction_count(account.address)
-
-        max_attempts = remaining + 10  # allow some retries
+        consecutive_fails = 0
+        max_attempts = remaining + 15
         attempts = 0
         while msb_tx < TASK_TOTAL_TX and attempts < max_attempts:
             attempts += 1
-            roll = random.random()
 
-            # Pick task based on what's still possible
+            # Refresh balances from chain every 5 attempts to stay in sync
+            if attempts % 5 == 0:
+                usdt_bal = check_balance(w3, USDT_SEPOLIA, account.address, 6)
+                usdc_bal = check_balance(w3, USDC_SEPOLIA, account.address, 6)
+                tp_bal = check_balance(w3, T_PLUS_CONTRACT, account.address, 18)
+                cp_bal = check_balance(w3, C_PLUS_CONTRACT, account.address, 18)
+
+            roll = random.random()
+            ok = False
+
             if roll < 0.40 and usdt_bal >= 15:
-                # Mint T+ (uses USDT)
                 amt = rand_amount(10, min(50, usdt_bal))
                 ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", amt, max_retries)
                 if ok:
@@ -889,21 +983,19 @@ def run_daily_tasks(
                     usdt_bal -= amt
                     tp_bal += amt
             elif roll < 0.55 and usdc_bal >= 15:
-                # Mint C+ (uses USDC)
                 amt = rand_amount(10, min(50, usdc_bal))
                 ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", amt, max_retries)
                 if ok:
                     msb_tx += 1
                     usdc_bal -= amt
+                    cp_bal += amt
             elif roll < 0.80 and tp_bal >= 10:
-                # Stake T+
                 amt = rand_amount(5, min(30, tp_bal))
                 ok, nonce = do_stake(w3, account, nonce, debug, "T+", amt, max_retries)
                 if ok:
                     msb_tx += 1
                     tp_bal -= amt
             elif usdt_bal >= 15:
-                # Fallback: mint T+
                 amt = rand_amount(10, min(50, usdt_bal))
                 ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "T+", amt, max_retries)
                 if ok:
@@ -911,24 +1003,41 @@ def run_daily_tasks(
                     usdt_bal -= amt
                     tp_bal += amt
             elif tp_bal >= 5:
-                # Fallback: stake T+
                 amt = rand_amount(3, min(20, tp_bal))
                 ok, nonce = do_stake(w3, account, nonce, debug, "T+", amt, max_retries)
                 if ok:
                     msb_tx += 1
                     tp_bal -= amt
+            elif cp_bal >= 3:
+                amt = rand_amount(2, min(10, cp_bal))
+                ok, nonce = do_bridge_oft(w3, account, nonce, debug, "C+", amt, max_retries)
+                if ok:
+                    msb_tx += 1
+                    cp_bal -= amt
+            elif usdc_bal >= 15:
+                amt = rand_amount(10, min(50, usdc_bal))
+                ok, nonce = do_overlayer_mint(w3, account, nonce, debug, "C+", amt, max_retries)
+                if ok:
+                    msb_tx += 1
+                    usdc_bal -= amt
+                    cp_bal += amt
             else:
-                # Last resort: bridge small C+
-                cp_token_c = w3.eth.contract(address=Web3.to_checksum_address(C_PLUS_CONTRACT), abi=ERC20_ABI)
-                cp_bal = cp_token_c.functions.balanceOf(account.address).call() / (10 ** 18)
-                if cp_bal >= 3:
-                    amt = rand_amount(2, min(10, cp_bal))
-                    ok, nonce = do_bridge_oft(w3, account, nonce, debug, "C+", amt, max_retries)
-                    if ok:
-                        msb_tx += 1
-                else:
-                    log.warning(f"    {C.YELLOW}Low balances, can't fill more tx{C.RESET}")
-                    break
+                log.warning(f"    {C.YELLOW}All balances too low, can't fill more tx{C.RESET}")
+                break
+
+            if ok:
+                consecutive_fails = 0
+            else:
+                consecutive_fails += 1
+                # Refresh balances on failure
+                usdt_bal = check_balance(w3, USDT_SEPOLIA, account.address, 6)
+                usdc_bal = check_balance(w3, USDC_SEPOLIA, account.address, 6)
+                tp_bal = check_balance(w3, T_PLUS_CONTRACT, account.address, 18)
+                cp_bal = check_balance(w3, C_PLUS_CONTRACT, account.address, 18)
+                if consecutive_fails >= 3:
+                    log.warning(f"    {C.YELLOW}3 consecutive failures, refreshing nonce...{C.RESET}")
+                    nonce = w3.eth.get_transaction_count(account.address)
+                    consecutive_fails = 0
 
             time.sleep(random.uniform(0.5, 2))
 
